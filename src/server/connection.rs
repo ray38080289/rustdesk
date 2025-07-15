@@ -35,22 +35,31 @@ use hbb_common::{
     password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
     sleep, timeout,
-    tokio::{
-        net::TcpStream,
-        sync::mpsc,
-        time::{self, Duration, Instant},
-    },
-    tokio_util::codec::{BytesCodec, Framed},
-};
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use scrap::android::{call_main_service_key_event, call_main_service_pointer_input};
-use scrap::camera;
-use serde_derive::Serialize;
-use serde_json::{json, value::Value};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::sync::atomic::Ordering;
-use std::{
-    num::NonZeroI64,
+        log_access(AccessEvent::ConnectResult {
+            ip: self.ip.as_str(),
+            user: self.my_name.as_str(),
+            method: self.login_method.as_deref().unwrap_or("unknown"),
+            ok,
+            msg,
+        });
+        if ok {
+            self.authorized = true;
+            self.send_message(Message::new(message::Union::LogonResponse(
+                LogonResponse {
+                    ok: true,
+                    msg: msg.to_owned(),
+                },
+            )))
+            .await;
+        } else {
+            self.send_message(Message::new(message::Union::LogonResponse(
+                LogonResponse {
+                    ok: false,
+                    msg: msg.to_owned(),
+                },
+            )))
+            .await;
+        }
     path::PathBuf,
     sync::{atomic::AtomicI64, mpsc as std_mpsc},
 };
@@ -169,7 +178,6 @@ pub enum AuthConnType {
     FileTransfer,
     PortForward,
     ViewCamera,
-    Terminal,
 }
 
 pub struct Connection {
@@ -183,7 +191,6 @@ pub struct Connection {
     file_timer: crate::RustDeskInterval,
     file_transfer: Option<(String, bool)>,
     view_camera: bool,
-    terminal: bool,
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
     port_forward_address: String,
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
@@ -249,12 +256,6 @@ pub struct Connection {
     multi_ui_session: bool,
     tx_from_authed: mpsc::UnboundedSender<ipc::Data>,
     printer_data: Vec<(Instant, String, Vec<u8>)>,
-    // For post requests that need to be sent sequentially.
-    // eg. post_conn_audit
-    tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
-    terminal_service_id: String,
-    terminal_persistent: bool,
-    terminal_generic_service: Option<Box<GenericService>>,
 }
 
 impl ConnInner {
@@ -329,11 +330,6 @@ impl Connection {
         let linux_headless_handle =
             LinuxHeadlessHandle::new(_rx_cm_stream_ready, _tx_desktop_ready);
 
-        let (tx_post_seq, rx_post_seq) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            Self::post_seq_loop(rx_post_seq).await;
-        });
-
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tx_cloned = tx.clone();
         let mut conn = Self {
@@ -352,7 +348,6 @@ impl Connection {
             file_timer: crate::rustdesk_interval(time::interval(SEC30)),
             file_transfer: None,
             view_camera: false,
-            terminal: false,
             port_forward_socket: None,
             port_forward_address: "".to_owned(),
             tx_to_cm,
@@ -415,10 +410,6 @@ impl Connection {
             retina: Retina::default(),
             tx_from_authed,
             printer_data: Vec::new(),
-            tx_post_seq,
-            terminal_service_id: "".to_owned(),
-            terminal_persistent: false,
-            terminal_generic_service: None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -459,7 +450,7 @@ impl Connection {
         let mut last_recv_time = Instant::now();
 
         conn.stream.set_send_timeout(
-            if conn.file_transfer.is_some() || conn.port_forward_socket.is_some() || conn.terminal {
+            if conn.file_transfer.is_some() || conn.port_forward_socket.is_some() {
                 SEND_TIMEOUT_OTHER
             } else {
                 SEND_TIMEOUT_VIDEO
@@ -978,14 +969,7 @@ impl Connection {
         }
         #[cfg(target_os = "linux")]
         clear_remapped_keycode();
-        log::debug!("Input thread exited");
-    }
-
-    async fn post_seq_loop(mut rx: mpsc::UnboundedReceiver<(String, Value)>) {
-        while let Some((url, v)) = rx.recv().await {
-            allow_err!(Self::post_audit_async(url, v).await);
-        }
-        log::debug!("post_seq_loop exited");
+        log::info!("Input thread exited");
     }
 
     async fn try_port_forward_loop(
@@ -1142,7 +1126,9 @@ impl Connection {
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["conn_id"] = json!(self.inner.id);
         v["session_id"] = json!(self.lr.session_id);
-        allow_err!(self.tx_post_seq.send((url, v)));
+        tokio::spawn(async move {
+            allow_err!(Self::post_audit_async(url, v).await);
+        });
     }
 
     fn get_files_for_audit(job_type: fs::JobType, mut files: Vec<FileEntry>) -> Vec<(String, i64)> {
@@ -1262,8 +1248,6 @@ impl Connection {
             (2, AuthConnType::PortForward)
         } else if self.view_camera {
             (3, AuthConnType::ViewCamera)
-        } else if self.terminal {
-            (4, AuthConnType::Terminal)
         } else {
             (0, AuthConnType::Remote)
         };
@@ -1372,7 +1356,8 @@ impl Connection {
             return;
         }
         #[cfg(target_os = "linux")]
-        if self.is_remote() {
+        if !self.file_transfer.is_some() && !self.port_forward_socket.is_some() && !self.view_camera
+        {
             let mut msg = "".to_string();
             if crate::platform::linux::is_login_screen_wayland() {
                 msg = crate::client::LOGIN_SCREEN_WAYLAND.to_owned()
@@ -1403,8 +1388,7 @@ impl Connection {
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if self.file_transfer.is_some() {
-            if crate::platform::is_prelogin() {
-                // }|| self.tx_to_cm.send(ipc::Data::Test).is_err() {
+            if crate::platform::is_prelogin() || self.tx_to_cm.send(ipc::Data::Test).is_err() {
                 username = "".to_owned();
             }
         }
@@ -1419,8 +1403,6 @@ impl Connection {
         pi.sas_enabled = sas_enabled;
         pi.features = Some(Features {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            terminal: true, // Terminal feature is supported on desktop only
             ..Default::default()
         })
         .into();
@@ -1430,7 +1412,7 @@ impl Connection {
         let mut wait_session_id_confirm = false;
         #[cfg(windows)]
         self.handle_windows_specific_session(&mut pi, &mut wait_session_id_confirm);
-        if self.file_transfer.is_some() || self.terminal {
+        if self.file_transfer.is_some() {
             res.set_peer_info(pi);
         } else if self.view_camera {
             let supported_encoding = scrap::codec::Encoder::supported_encoding();
@@ -1522,10 +1504,6 @@ impl Connection {
             } else {
                 self.delayed_read_dir = Some((dir.to_owned(), show_hidden));
             }
-        } else if self.terminal {
-            self.keyboard = false;
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            self.init_terminal_service().await;
         } else if self.view_camera {
             if !wait_session_id_confirm {
                 self.try_sub_camera_displays();
@@ -1548,16 +1526,9 @@ impl Connection {
         }
     }
 
-    #[inline]
-    fn is_remote(&self) -> bool {
-        self.file_transfer.is_none()
-            && self.port_forward_socket.is_none()
-            && !self.view_camera
-            && !self.terminal
-    }
-
     fn try_sub_monitor_services(&mut self) {
-        let is_remote = self.is_remote();
+        let is_remote =
+            self.file_transfer.is_none() && self.port_forward_socket.is_none() && !self.view_camera;
         if is_remote && !self.services_subed {
             self.services_subed = true;
             if let Some(s) = self.server.upgrade() {
@@ -1675,7 +1646,6 @@ impl Connection {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
             is_view_camera: self.view_camera,
-            is_terminal: self.terminal,
             port_forward: self.port_forward_address.clone(),
             peer_id,
             name,
@@ -1882,7 +1852,7 @@ impl Connection {
                 )
                 .await
                 {
-                    log::warn!("ipc to connection manager exit: {}", err);
+                    log::error!("ipc to connection manager exit: {}", err);
                     // https://github.com/rustdesk/rustdesk-server-pro/discussions/382#discussioncomment-10525725, cm may start failed
                     #[cfg(windows)]
                     if !crate::platform::is_prelogin()
@@ -1908,6 +1878,17 @@ impl Connection {
             if self.authorized {
                 return true;
             }
+            let (method, user) = match lr.union {
+                Some(login_request::Union::FileTransfer(_)) => ("file_transfer", lr.my_name.as_str()),
+                Some(login_request::Union::ViewCamera(_)) => ("view_camera", lr.my_name.as_str()),
+                Some(login_request::Union::PortForward(_)) => ("port_forward", lr.my_name.as_str()),
+                _ => ("remote", lr.my_name.as_str()),
+            };
+            log_access(AccessEvent::Incoming {
+                ip: self.ip.as_str(),
+                user,
+                method,
+            });
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Connection::permission(keys::OPTION_ENABLE_FILE_TRANSFER) {
@@ -1926,19 +1907,6 @@ impl Connection {
                         return false;
                     }
                     self.view_camera = true;
-                }
-                Some(login_request::Union::Terminal(terminal)) => {
-                    if !Connection::permission(keys::OPTION_ENABLE_TERMINAL) {
-                        self.send_login_error("No permission of terminal").await;
-                        sleep(1.).await;
-                        return false;
-                    }
-                    self.terminal = true;
-                    if let Some(o) = self.options_in_login.as_ref() {
-                        self.terminal_persistent =
-                            o.terminal_persistent.enum_value() == Ok(BoolOption::Yes);
-                    }
-                    self.terminal_service_id = terminal.service_id;
                 }
                 Some(login_request::Union::PortForward(mut pf)) => {
                     if !Connection::permission("enable-tunnel") {
@@ -2829,7 +2797,7 @@ impl Connection {
                                 }
                             } else if self.view_camera {
                                 self.try_sub_camera_displays();
-                            } else if !self.terminal {
+                            } else {
                                 self.try_sub_monitor_services();
                             }
                         }
@@ -2880,12 +2848,6 @@ impl Connection {
                         );
                         self.refresh_video_display(Some(request.display as usize));
                     }
-                }
-                Some(message::Union::TerminalAction(action)) => {
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    allow_err!(self.handle_terminal_action(action).await);
-                    #[cfg(any(target_os = "android", target_os = "ios"))]
-                    log::warn!("Terminal action received but not supported on this platform");
                 }
                 _ => {}
             }
@@ -3151,18 +3113,10 @@ impl Connection {
                     if virtual_display_manager::amyuni_idd::is_my_display(&name) {
                         record_changed = false;
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    let scale = 1.0;
-                    #[cfg(target_os = "macos")]
-                    let scale = display.scale();
-                    let original = (
-                        ((display.width() as f64) / scale).round() as _,
-                        (display.height() as f64 / scale).round() as _,
-                    );
                     if record_changed {
                         display_service::set_last_changed_resolution(
                             &name,
-                            original,
+                            (display.width() as _, display.height() as _),
                             (r.width, r.height),
                         );
                     }
@@ -3415,12 +3369,6 @@ impl Connection {
                 }
             }
         }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if let Ok(q) = o.terminal_persistent.enum_value() {
-            if q != BoolOption::NotSet {
-                self.update_terminal_persistence(q == BoolOption::Yes).await;
-            }
-        }
     }
 
     async fn turn_on_privacy(&mut self, impl_key: String) {
@@ -3543,6 +3491,12 @@ impl Connection {
         if self.closed {
             return;
         }
+        // access log: disconnect event
+        log_access(AccessEvent::Disconnect {
+            ip: self.ip.as_str(),
+            user: self.my_name.as_str(),
+            reason,
+        });
         self.closed = true;
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
@@ -3612,7 +3566,12 @@ impl Connection {
 
     #[cfg(windows)]
     fn portable_check(&mut self) {
-        if self.portable.is_installed || !self.is_remote() || !self.keyboard {
+        if self.portable.is_installed
+            || self.file_transfer.is_some()
+            || self.view_camera
+            || self.port_forward_socket.is_some()
+            || !self.keyboard
+        {
             return;
         }
         let running = portable_client::running();
@@ -3773,6 +3732,15 @@ impl Connection {
         log::debug!(
             "Process clipboard message from clip, stop: {}, is_stopping_allowed: {}, file_transfer_enabled: {}",
             stop, is_stopping_allowed, file_transfer_enabled);
+        // access log: file transfer event
+        if let Some(path) = clip.get_path() {
+            log_access(AccessEvent::FileTransfer {
+                ip: self.ip.as_str(),
+                user: self.my_name.as_str(),
+                path: path.to_string_lossy().as_ref(),
+                success: !stop,
+            });
+        }
         if !stop {
             use hbb_common::config::keys::OPTION_ONE_WAY_FILE_TRANSFER;
             // Note: Code will not reach here if `crate::get_builtin_option(OPTION_ONE_WAY_FILE_TRANSFER) == "Y"` is true.
@@ -3823,55 +3791,6 @@ impl Connection {
         };
         msg_out.set_message_box(res);
         self.send(msg_out).await;
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    async fn update_terminal_persistence(&mut self, persistent: bool) {
-        self.terminal_persistent = persistent;
-        terminal_service::set_persistent(&self.terminal_service_id, persistent).ok();
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    async fn init_terminal_service(&mut self) {
-        if self.terminal_service_id.is_empty() {
-            self.terminal_service_id = terminal_service::generate_service_id();
-        }
-        let s = Box::new(terminal_service::new(
-            self.terminal_service_id.clone(),
-            self.terminal_persistent,
-        ));
-        s.on_subscribe(self.inner.clone());
-        self.terminal_generic_service = Some(s);
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    async fn handle_terminal_action(&mut self, action: TerminalAction) -> ResultType<()> {
-        let mut proxy = terminal_service::TerminalServiceProxy::new(
-            self.terminal_service_id.clone(),
-            Some(self.terminal_persistent),
-        );
-
-        match proxy.handle_action(&action) {
-            Ok(Some(response)) => {
-                let mut msg_out = Message::new();
-                msg_out.set_terminal_response(response);
-                self.send(msg_out).await;
-            }
-            Ok(None) => {
-                // No response needed
-            }
-            Err(err) => {
-                let mut response = TerminalResponse::new();
-                let mut error = TerminalError::new();
-                error.message = format!("Failed to handle action: {}", err);
-                response.set_error(error);
-                let mut msg_out = Message::new();
-                msg_out.set_terminal_response(response);
-                self.send(msg_out).await;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -4245,10 +4164,6 @@ impl Drop for Connection {
     fn drop(&mut self) {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         self.release_pressed_modifiers();
-
-        if let Some(s) = self.terminal_generic_service.as_ref() {
-            s.join();
-        }
     }
 }
 
@@ -4544,7 +4459,7 @@ mod raii {
                     *WALLPAPER_REMOVER.lock().unwrap() = None;
                 }
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                display_service::restore_resolutions();
+                display_service::reset_resolutions();
                 #[cfg(windows)]
                 let _ = virtual_display_manager::reset_all();
                 #[cfg(target_os = "linux")]
