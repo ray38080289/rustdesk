@@ -35,22 +35,31 @@ use hbb_common::{
     password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
     sleep, timeout,
-    tokio::{
-        net::TcpStream,
-        sync::mpsc,
-        time::{self, Duration, Instant},
-    },
-    tokio_util::codec::{BytesCodec, Framed},
-};
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use scrap::android::{call_main_service_key_event, call_main_service_pointer_input};
-use scrap::camera;
-use serde_derive::Serialize;
-use serde_json::{json, value::Value};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::sync::atomic::Ordering;
-use std::{
-    num::NonZeroI64,
+        log_access(AccessEvent::ConnectResult {
+            ip: self.ip.as_str(),
+            user: self.my_name.as_str(),
+            method: self.login_method.as_deref().unwrap_or("unknown"),
+            ok,
+            msg,
+        });
+        if ok {
+            self.authorized = true;
+            self.send_message(Message::new(message::Union::LogonResponse(
+                LogonResponse {
+                    ok: true,
+                    msg: msg.to_owned(),
+                },
+            )))
+            .await;
+        } else {
+            self.send_message(Message::new(message::Union::LogonResponse(
+                LogonResponse {
+                    ok: false,
+                    msg: msg.to_owned(),
+                },
+            )))
+            .await;
+        }
     path::PathBuf,
     sync::{atomic::AtomicI64, mpsc as std_mpsc},
 };
@@ -1869,6 +1878,17 @@ impl Connection {
             if self.authorized {
                 return true;
             }
+            let (method, user) = match lr.union {
+                Some(login_request::Union::FileTransfer(_)) => ("file_transfer", lr.my_name.as_str()),
+                Some(login_request::Union::ViewCamera(_)) => ("view_camera", lr.my_name.as_str()),
+                Some(login_request::Union::PortForward(_)) => ("port_forward", lr.my_name.as_str()),
+                _ => ("remote", lr.my_name.as_str()),
+            };
+            log_access(AccessEvent::Incoming {
+                ip: self.ip.as_str(),
+                user,
+                method,
+            });
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Connection::permission(keys::OPTION_ENABLE_FILE_TRANSFER) {
@@ -3471,6 +3491,12 @@ impl Connection {
         if self.closed {
             return;
         }
+        // access log: disconnect event
+        log_access(AccessEvent::Disconnect {
+            ip: self.ip.as_str(),
+            user: self.my_name.as_str(),
+            reason,
+        });
         self.closed = true;
         // If voice A,B -> C, and A,B has voice call
         // B disconnects, C will reset the voice call input.
@@ -3706,6 +3732,15 @@ impl Connection {
         log::debug!(
             "Process clipboard message from clip, stop: {}, is_stopping_allowed: {}, file_transfer_enabled: {}",
             stop, is_stopping_allowed, file_transfer_enabled);
+        // access log: file transfer event
+        if let Some(path) = clip.get_path() {
+            log_access(AccessEvent::FileTransfer {
+                ip: self.ip.as_str(),
+                user: self.my_name.as_str(),
+                path: path.to_string_lossy().as_ref(),
+                success: !stop,
+            });
+        }
         if !stop {
             use hbb_common::config::keys::OPTION_ONE_WAY_FILE_TRANSFER;
             // Note: Code will not reach here if `crate::get_builtin_option(OPTION_ONE_WAY_FILE_TRANSFER) == "Y"` is true.
