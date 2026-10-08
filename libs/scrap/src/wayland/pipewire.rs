@@ -283,9 +283,23 @@ impl PipeWireRecorder {
         src.set_property("path", &format!("{}", capturable.path))?;
         src.set_property("keepalive_time", &1_000.as_raw_fd())?;
 
+        // sx4: take the compositor's dma-bufs as they are and let the GPU convert them to
+        // NV12, so neither KWin (glReadPixels into shared memory) nor we (libyuv) handle
+        // BGRx on the CPU. RUSTDESK_PW_CONVERT replaces the chain, empty = stock path.
+        let gpu = std::env::var("RUSTDESK_PW_CONVERT")
+            .unwrap_or_else(|_| "glupload ! glcolorconvert ! gldownload".into());
+        let gpu = if gpu.is_empty() {
+            None
+        } else {
+            gst::parse_bin_from_description(&gpu, true)
+                .map_err(|e| warn!("[gstreamer] GPU convert {:?} unavailable: {}", gpu, e))
+                .ok()
+        };
+
         // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
         // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
-        src.set_property("always-copy", &true)?;
+        // A copy would map the dma-buf on the CPU, which is what the GPU path avoids.
+        src.set_property("always-copy", &gpu.is_none())?;
 
         // COSMIC/Wayland fix: insert videoconvert between pipewiresrc and appsink.
         // xdg-desktop-portal-cosmic's modifier negotiation fails when the downstream
@@ -293,7 +307,11 @@ impl PipeWireRecorder {
         // "no more output formats" / not-negotiated (-4). videoconvert accepts any
         // system-memory video/x-raw format, widening negotiation so the portal can
         // settle on a format it can deliver via its SHM path.
-        let convert = gst_element("videoconvert")?;
+        let nv12 = gpu.is_some();
+        let convert = match gpu {
+            Some(bin) => bin.upcast::<gst::Element>(),
+            None => gst_element("videoconvert")?,
+        };
 
         let sink = gst_element("appsink")?;
         sink.set_property("drop", &true)?;
@@ -307,6 +325,12 @@ impl PipeWireRecorder {
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
         let mut caps = gst::Caps::new_empty();
+        if nv12 {
+            caps.merge_structure(gst::structure::Structure::new(
+                "video/x-raw",
+                &[("format", &"NV12")],
+            ));
+        }
         caps.merge_structure(gst::structure::Structure::new(
             "video/x-raw",
             &[("format", &"BGRx")],
@@ -392,7 +416,8 @@ impl Recorder for PipeWireRecorder {
                 .get_meta::<gstreamer_video::VideoCropMeta>()
                 .map(|m| m.get_rect());
             // only crop if necessary
-            if Some((0, 0, w as u32, h as u32)) == crop {
+            // ponytail: no crop for NV12 (KWin sends whole outputs); crop it here if a portal does
+            if Some((0, 0, w as u32, h as u32)) == crop || self.pix_fmt == "NV12" {
                 crop = None;
             }
             let buf = buf
@@ -402,8 +427,9 @@ impl Recorder for PipeWireRecorder {
                 return Ok(PixelProvider::NONE);
             }
             let buf_size = buf.get_size();
-            // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
+            // BGRx is 4 bytes per pixel, NV12 1.5
+            let frame_size = if self.pix_fmt == "NV12" { w * h * 3 / 2 } else { w * h * 4 };
+            if buf_size != frame_size {
                 // for some reason the width and height of the caps do not guarantee correct buffer
                 // size, so ignore those buffers, see:
                 // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
@@ -456,6 +482,7 @@ impl Recorder for PipeWireRecorder {
         match self.pix_fmt.as_str() {
             "BGRx" => Ok(PixelProvider::BGR0(self.width, self.height, buf)),
             "RGBx" => Ok(PixelProvider::RGB0(self.width, self.height, buf)),
+            "NV12" => Ok(PixelProvider::NV12(self.width, self.height, buf)),
             _ => Err(Box::new(GStreamerError(format!(
                 "Unreachable! Unknown pix_fmt, {}",
                 &self.pix_fmt

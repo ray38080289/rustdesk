@@ -134,6 +134,51 @@ pub fn convert_to_yuv(
                 src_height as _,
             ));
         }
+        (crate::Pixfmt::NV12, crate::Pixfmt::NV12) => {
+            if src.len() < src_width * src_height * 3 / 2 {
+                bail!("wrong src len, {} < nv12 {}x{}", src.len(), src_width, src_height);
+            }
+            let dst_stride_y = dst_fmt.stride[0];
+            let dst_stride_uv = dst_fmt.stride[1];
+            dst.resize(
+                align(dst_fmt.h) * (align(dst_stride_y) + align(dst_stride_uv / 2)),
+                0,
+            );
+            for y in 0..src_height {
+                dst[y * dst_stride_y..][..src_width]
+                    .copy_from_slice(&src[y * src_stride[0]..][..src_width]);
+            }
+            let src_uv = &src[src_stride[0] * src_height..];
+            for y in 0..(src_height + 1) / 2 {
+                dst[dst_fmt.u + y * dst_stride_uv..][..src_width]
+                    .copy_from_slice(&src_uv[y * src_stride[1]..][..src_width]);
+            }
+        }
+        (crate::Pixfmt::NV12, crate::Pixfmt::I420) => {
+            if src.len() < src_width * src_height * 3 / 2 {
+                bail!("wrong src len, {} < nv12 {}x{}", src.len(), src_width, src_height);
+            }
+            let dst_stride_y = dst_fmt.stride[0];
+            let dst_stride_uv = dst_fmt.stride[1];
+            dst.resize(dst_fmt.h * dst_stride_y * 2, 0);
+            let dst_y = dst.as_mut_ptr();
+            let dst_u = dst[dst_fmt.u..].as_mut_ptr();
+            let dst_v = dst[dst_fmt.v..].as_mut_ptr();
+            call_yuv!(NV12ToI420(
+                src.as_ptr(),
+                src_stride[0] as _,
+                src[src_stride[0] * src_height..].as_ptr(),
+                src_stride[1] as _,
+                dst_y,
+                dst_stride_y as _,
+                dst_u,
+                dst_stride_uv as _,
+                dst_v,
+                dst_stride_uv as _,
+                src_width as _,
+                src_height as _,
+            ));
+        }
         (crate::Pixfmt::BGRA, crate::Pixfmt::I444)
         | (crate::Pixfmt::RGBA, crate::Pixfmt::I444)
         | (crate::Pixfmt::RGB565LE, crate::Pixfmt::I444) => {

@@ -43,9 +43,12 @@ pub struct PixelBuffer<'a> {
 
 impl<'a> PixelBuffer<'a> {
     pub fn new(data: &'a [u8], pixfmt: Pixfmt, width: usize, height: usize) -> Self {
-        let stride0 = data.len() / height;
-        let mut stride = Vec::new();
-        stride.push(stride0);
+        // NV12 (PipeWire GPU path): two planes, both width bytes per row
+        let stride = if pixfmt == Pixfmt::NV12 {
+            vec![width, width]
+        } else {
+            vec![data.len() / height]
+        };
         Self {
             data,
             pixfmt,
