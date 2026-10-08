@@ -27,6 +27,17 @@ use base::platform::linux::CMD_SH;
 use hbb_common::{anyhow::anyhow, bail, config, serde_json, tokio, ResultType};
 
 use super::capturable::PixelProvider;
+
+extern "C" {
+    // sx4_va.c: a DMA_DRM sample -> NV12 (stride = width) through VA-API VideoProc, 0 on success
+    fn sx4_va_nv12_from_sample(
+        sample: *mut std::ffi::c_void,
+        out: *mut u8,
+        out_len: usize,
+        w: i32,
+        h: i32,
+    ) -> i32;
+}
 use super::capturable::{Capturable, Recorder};
 use super::display::{clear_wayland_displays_cache, get_displays, Displays};
 use super::remote_desktop_portal::OrgFreedesktopPortalRemoteDesktop as remote_desktop_portal;
@@ -283,23 +294,25 @@ impl PipeWireRecorder {
         src.set_property("path", &format!("{}", capturable.path))?;
         src.set_property("keepalive_time", &1_000.as_raw_fd())?;
 
-        // sx4: take the compositor's dma-bufs as they are and let the GPU convert them to
-        // NV12, so neither KWin (glReadPixels into shared memory) nor we (libyuv) handle
-        // BGRx on the CPU. RUSTDESK_PW_CONVERT replaces the chain, empty = stock path.
-        let gpu = std::env::var("RUSTDESK_PW_CONVERT")
-            .unwrap_or_else(|_| "glupload ! glcolorconvert ! gldownload".into());
-        let gpu = if gpu.is_empty() {
+        // sx4: RUSTDESK_PW_CONVERT picks the path. "va" (default): the compositor's dma-bufs go
+        // to VA-API VideoProc (sx4_va.c), which writes NV12 into cached memory; a gst-launch
+        // chain (e.g. "glupload ! glcolorconvert ! gldownload") converts to NV12 in GStreamer;
+        // empty: the stock videoconvert/BGRx path. GL leaves its result in write-combined GPU
+        // memory, which is slow for the CPU to read, hence VA by default.
+        let mode = std::env::var("RUSTDESK_PW_CONVERT").unwrap_or_else(|_| "va".into());
+        let dmabuf = mode == "va";
+        let gpu = if mode.is_empty() || dmabuf {
             None
         } else {
-            gst::parse_bin_from_description(&gpu, true)
-                .map_err(|e| warn!("[gstreamer] GPU convert {:?} unavailable: {}", gpu, e))
+            gst::parse_bin_from_description(&mode, true)
+                .map_err(|e| warn!("[gstreamer] convert {:?} unavailable: {}", mode, e))
                 .ok()
         };
 
         // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
         // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
-        // A copy would map the dma-buf on the CPU, which is what the GPU path avoids.
-        src.set_property("always-copy", &gpu.is_none())?;
+        // A copy would map the dma-buf on the CPU, which is what the other paths avoid.
+        src.set_property("always-copy", &(gpu.is_none() && !dmabuf))?;
 
         // COSMIC/Wayland fix: insert videoconvert between pipewiresrc and appsink.
         // xdg-desktop-portal-cosmic's modifier negotiation fails when the downstream
@@ -309,22 +322,33 @@ impl PipeWireRecorder {
         // settle on a format it can deliver via its SHM path.
         let nv12 = gpu.is_some();
         let convert = match gpu {
-            Some(bin) => bin.upcast::<gst::Element>(),
-            None => gst_element("videoconvert")?,
+            Some(bin) => Some(bin.upcast::<gst::Element>()),
+            None if dmabuf => None,
+            None => Some(gst_element("videoconvert")?),
         };
 
         let sink = gst_element("appsink")?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
 
-        pipeline.add_many(&[&src, &convert, &sink])?;
-        src.link(&convert)?;
-        convert.link(&sink)?;
+        if let Some(convert) = &convert {
+            pipeline.add_many(&[&src, convert, &sink])?;
+            src.link(convert)?;
+            convert.link(&sink)?;
+        } else {
+            pipeline.add_many(&[&src, &sink])?;
+            src.link(&sink)?;
+        }
 
         let appsink = sink
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
         let mut caps = gst::Caps::new_empty();
+        if dmabuf {
+            caps = <gst::Caps as std::str::FromStr>::from_str(
+                "video/x-raw(memory:DMABuf), format=DMA_DRM",
+            )?;
+        }
         if nv12 {
             caps.merge_structure(gst::structure::Structure::new(
                 "video/x-raw",
@@ -408,6 +432,31 @@ impl Recorder for PipeWireRecorder {
                 .get::<&str>("format")?
                 .ok_or("Failed to get pixel format")?
                 .to_string();
+
+            if self.pix_fmt == "DMA_DRM" {
+                // sx4: the GPU converts, the CPU copies once out of cached memory
+                self.buffer_cropped.resize(w * h * 3 / 2, 0);
+                let r = unsafe {
+                    sx4_va_nv12_from_sample(
+                        sample.as_ptr() as *mut std::ffi::c_void,
+                        self.buffer_cropped.as_mut_ptr(),
+                        self.buffer_cropped.len(),
+                        w as i32,
+                        h as i32,
+                    )
+                };
+                if r != 0 {
+                    return Err(Box::new(GStreamerError(format!("sx4_va: {}", r))));
+                }
+                if let Err(..) =
+                    crate::would_block_if_equal(&mut self.saved_raw_data, &self.buffer_cropped)
+                {
+                    return Ok(PixelProvider::NONE);
+                }
+                self.width = w;
+                self.height = h;
+                return Ok(PixelProvider::NV12(w, h, &self.buffer_cropped));
+            }
 
             let buf = sample
                 .get_buffer_owned()

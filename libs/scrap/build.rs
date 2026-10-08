@@ -226,7 +226,37 @@ fn ffmpeg() {
 }
 */
 
+// sx4: VA-API conversion of PipeWire dma-bufs (src/wayland/sx4_va.c)
+fn build_sx4_va() {
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() != "linux" {
+        return;
+    }
+    let pkgs = [
+        "gstreamer-1.0",
+        "gstreamer-allocators-1.0",
+        "gstreamer-video-1.0",
+        "libva",
+        "libva-drm",
+    ];
+    let cflags = std::process::Command::new("pkg-config")
+        .arg("--cflags")
+        .args(&pkgs)
+        .output()
+        .expect("pkg-config");
+    let mut b = cc::Build::new();
+    b.file("src/wayland/sx4_va.c");
+    for f in String::from_utf8_lossy(&cflags.stdout).split_whitespace() {
+        b.flag(f);
+    }
+    b.compile("sx4_va");
+    for lib in ["gstallocators-1.0", "gstvideo-1.0", "gstreamer-1.0", "va", "va-drm"] {
+        println!("cargo:rustc-link-lib={}", lib);
+    }
+    println!("cargo:rerun-if-changed=src/wayland/sx4_va.c");
+}
+
 fn main() {
+    build_sx4_va();
     // in this crate, these are also valid configurations
     println!("cargo:rustc-check-cfg=cfg(dxgi,quartz,x11)");
 

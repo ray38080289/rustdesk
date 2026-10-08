@@ -118,7 +118,7 @@ jobs:
             printf "[source.crates-io]\nregistry = 'https://github.com/rust-lang/crates.io-index'\n" > ~/.cargo/config
             cd /workspace
             export VCPKG_ROOT=/opt/artifacts/vcpkg
-            cargo build --locked --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
+            cargo build --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
             ls -l target/release/*.so
 
       - name: Upload librustdesk.so
