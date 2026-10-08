@@ -119,10 +119,10 @@ jobs:
             cd /workspace
             export VCPKG_ROOT=/opt/artifacts/vcpkg
             cargo build --locked --lib --jobs 3 --features hwcodec,flutter,unix-file-copy-paste --release
-            ls -l target/release/librustdesk.so
+            ls -l target/release/*.so
 
       - name: Upload librustdesk.so
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: librustdesk-aarch64
-          path: target/release/librustdesk.so
+          path: target/release/liblibrustdesk.so
