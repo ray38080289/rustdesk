@@ -345,13 +345,17 @@ impl PipeWireRecorder {
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
         let mut caps = gst::Caps::new_empty();
         if dmabuf {
-            // pipewiresrc offers the producer exactly the drm-formats listed here; KWin on sx4
-            // renders XR24/AR24 as AFBC, ARM tiled or linear. RUSTDESK_PW_DMABUF_CAPS overrides.
+            // pipewiresrc offers the producer exactly the drm-formats listed here: all KWin on sx4
+            // advertises (AFBC variants, ARM tiled, linear). A shorter list renegotiated badly when
+            // RustDesk rebuilt the pipeline on a codec SWITCH. RUSTDESK_PW_DMABUF_CAPS overrides.
             // ponytail: fixed list; ask the VA driver which modifiers it imports if this grows
             let dma = std::env::var("RUSTDESK_PW_DMABUF_CAPS").unwrap_or_else(|_| {
                 "video/x-raw(memory:DMABuf), format=DMA_DRM, drm-format=(string){ \
-                 XR24:0x0800000000000062, AR24:0x0800000000000062, \
-                 XR24:0x0810000000000001, AR24:0x0810000000000001, XR24, AR24 }"
+                 XR24:0x0800000000000062, AR24:0x0800000000000062, XR24:0x0800000000000072, AR24:0x0800000000000072, \
+                 XR24:0x0800000000000061, AR24:0x0800000000000061, XR24:0x0800000000000051, AR24:0x0800000000000051, \
+                 XR24:0x0800000000000041, AR24:0x0800000000000041, XR24:0x0800000000000351, AR24:0x0800000000000351, \
+                 XR24:0x0800000000000341, AR24:0x0800000000000341, XR24:0x0810000000000001, AR24:0x0810000000000001, \
+                 XR24, AR24 }"
                     .into()
             });
             caps = <gst::Caps as std::str::FromStr>::from_str(&dma)?;
