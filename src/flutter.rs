@@ -241,6 +241,8 @@ pub struct FlutterHandler {
 
 impl Default for FlutterHandler {
     fn default() -> Self {
+        #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+        set_macos_vt_native_output();
         Self {
             session_handlers: Default::default(),
             display_rgbas: Default::default(),
@@ -276,6 +278,26 @@ pub type FlutterGpuTextureRendererPluginCApiSetTexture =
 #[cfg(feature = "vram")]
 pub type FlutterGpuTextureRendererPluginCApiGetAdapterLuid = unsafe extern "C" fn() -> i64;
 
+/// macOS: VideoToolbox frames go to the texture as CVPixelBuffers only with texture rendering on and a plugin
+/// that has FlutterRgbaRendererPluginOnPixelBuffer.
+#[cfg(all(target_os = "macos", feature = "hwcodec"))]
+fn set_macos_vt_native_output() {
+    let has = match &*TEXTURE_RGBA_RENDERER_PLUGIN {
+        Ok(lib) => unsafe {
+            lib.symbol::<FlutterRgbaRendererPluginOnPixelBuffer>("FlutterRgbaRendererPluginOnPixelBuffer")
+                .is_ok()
+        },
+        Err(_) => false,
+    };
+    let on = has && crate::ui_interface::use_texture_render();
+    scrap::hwcodec::MACOS_VT_NATIVE_OUTPUT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// macOS: show a CVPixelBuffer in the rgba texture without copying (fork ray38080289/flutter_texture_rgba_renderer).
+#[cfg(target_os = "macos")]
+pub type FlutterRgbaRendererPluginOnPixelBuffer =
+    unsafe extern "C" fn(texture_rgba: *mut c_void, pixel_buffer: *mut c_void) -> c_int;
+
 pub(super) type TextureRgbaPtr = usize;
 
 struct DisplaySessionInfo {
@@ -294,6 +316,8 @@ struct VideoRenderer {
     map_display_sessions: Arc<RwLock<HashMap<usize, DisplaySessionInfo>>>,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     on_rgba_func: Option<Symbol<'static, FlutterRgbaRendererPluginOnRgba>>,
+    #[cfg(target_os = "macos")]
+    on_pixelbuffer_func: Option<Symbol<'static, FlutterRgbaRendererPluginOnPixelBuffer>>,
     #[cfg(feature = "vram")]
     on_texture_func: Option<Symbol<'static, FlutterGpuTextureRendererPluginCApiSetTexture>>,
 }
@@ -318,6 +342,21 @@ impl Default for VideoRenderer {
                 log::error!("Failed to load texture rgba renderer plugin, {e}");
                 None
             }
+        };
+        #[cfg(target_os = "macos")]
+        let on_pixelbuffer_func = match &*TEXTURE_RGBA_RENDERER_PLUGIN {
+            Ok(lib) => match unsafe {
+                lib.symbol::<FlutterRgbaRendererPluginOnPixelBuffer>(
+                    "FlutterRgbaRendererPluginOnPixelBuffer",
+                )
+            } {
+                Ok(sym) => Some(sym),
+                Err(e) => {
+                    log::info!("No FlutterRgbaRendererPluginOnPixelBuffer ({e}): VideoToolbox frames are converted");
+                    None
+                }
+            },
+            Err(_) => None,
         };
         #[cfg(feature = "vram")]
         let on_texture_func = match &*TEXTURE_GPU_RENDERER_PLUGIN {
@@ -346,6 +385,8 @@ impl Default for VideoRenderer {
             is_support_multi_ui_session: false,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             on_rgba_func,
+            #[cfg(target_os = "macos")]
+            on_pixelbuffer_func,
             #[cfg(feature = "vram")]
             on_texture_func,
         }
@@ -505,6 +546,33 @@ impl VideoRenderer {
         }
     }
 
+    /// macOS: a VideoToolbox CVPixelBuffer into the display's rgba texture, no copy. Returns whether the UI
+    /// must be told about the render type (as on_rgba).
+    #[cfg(target_os = "macos")]
+    pub fn on_pixelbuffer(&self, display: usize, pixel_buffer: *mut c_void) -> bool {
+        let mut write_lock = self.map_display_sessions.write().unwrap();
+        let opt_info = if !self.is_support_multi_ui_session {
+            write_lock.values_mut().next()
+        } else {
+            write_lock.get_mut(&display)
+        };
+        let Some(info) = opt_info else {
+            return false;
+        };
+        if info.texture_rgba_ptr == usize::default() {
+            return false;
+        }
+        if let Some(func) = &self.on_pixelbuffer_func {
+            unsafe { func(info.texture_rgba_ptr as _, pixel_buffer) };
+        }
+        if info.notify_render_type != Some(RenderType::PixelBuffer) {
+            info.notify_render_type = Some(RenderType::PixelBuffer);
+            true
+        } else {
+            false
+        }
+    }
+
     #[cfg(feature = "vram")]
     pub fn on_texture(&self, display: usize, texture: *mut c_void) -> bool {
         let mut write_lock = self.map_display_sessions.write().unwrap();
@@ -646,6 +714,8 @@ impl FlutterHandler {
     pub fn update_use_texture_render(&self) {
         self.use_texture_render
             .store(crate::ui_interface::use_texture_render(), Ordering::Relaxed);
+        #[cfg(all(target_os = "macos", feature = "hwcodec"))]
+        set_macos_vt_native_output();
         self.display_rgbas.write().unwrap().clear();
     }
 }
@@ -860,6 +930,19 @@ impl InvokeUiSession for FlutterHandler {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb) {
         self.on_rgba_soft_render(display, rgba);
+    }
+
+    // macOS: VideoToolbox CVPixelBuffers (scrap MACOS_VT_NATIVE_OUTPUT) go to the rgba texture as they are.
+    #[inline]
+    #[cfg(all(target_os = "macos", not(feature = "vram")))]
+    fn on_texture(&self, display: usize, texture: *mut c_void) {
+        for (_, session) in self.session_handlers.read().unwrap().iter() {
+            if session.renderer.on_pixelbuffer(display, texture) {
+                if let Some(stream) = &session.event_stream {
+                    stream.add(EventToUI::Texture(display, false));
+                }
+            }
+        }
     }
 
     #[inline]

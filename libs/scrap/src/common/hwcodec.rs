@@ -26,6 +26,11 @@ use hwcodec::{
 };
 
 const DEFAULT_PIXFMT: AVPixelFormat = AVPixelFormat::AV_PIX_FMT_NV12;
+
+/// macOS: hand VideoToolbox-decoded frames to the UI as CVPixelBuffers (no download, no RGBA conversion).
+/// Set by the Flutter UI while texture rendering is on; a decoder reads it when it is created.
+#[cfg(target_os = "macos")]
+pub static MACOS_VT_NATIVE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub const DEFAULT_FPS: i32 = 30;
 const DEFAULT_GOP: i32 = i32::MAX;
 const DEFAULT_HW_QUALITY: Quality = Quality_Default;
@@ -357,7 +362,17 @@ impl HwRamDecoder {
             thread_count: codec_thread_num(16) as _,
         };
         match Decoder::new(ctx) {
-            Ok(decoder) => Ok(HwRamDecoder { decoder, info }),
+            #[allow(unused_mut)]
+            Ok(mut decoder) => {
+                #[cfg(target_os = "macos")]
+                if info.hwdevice == hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX
+                    && MACOS_VT_NATIVE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let on = decoder.set_native_output(true);
+                    log::info!("VideoToolbox native output (CVPixelBuffer to the texture): {on}");
+                }
+                Ok(HwRamDecoder { decoder, info })
+            }
             Err(_) => {
                 HwCodecConfig::clear(false, false);
                 Err(anyhow!(format!("Failed to create decoder")))
@@ -377,6 +392,16 @@ pub struct HwRamDecoderImage<'a> {
 }
 
 impl HwRamDecoderImage<'_> {
+    /// macOS: the decoded frame as a CVPixelBufferRef (valid until the next decode call), with its size.
+    #[cfg(target_os = "macos")]
+    pub fn native(&self) -> Option<(usize, usize, usize)> {
+        if self.frame.native != 0 {
+            Some((self.frame.native, self.frame.width as _, self.frame.height as _))
+        } else {
+            None
+        }
+    }
+
     // rgb [in/out] fmt and stride must be set in ImageRgb
     pub fn to_fmt(&self, rgb: &mut ImageRgb, i420: &mut Vec<u8>) -> ResultType<()> {
         let frame = self.frame;
@@ -470,6 +495,9 @@ impl HwRamDecoderImage<'_> {
                     width,
                     height,
                 ));
+            }
+            AVPixelFormat::HWCODEC_PIX_FMT_CVPIXELBUFFER => {
+                bail!("a CVPixelBuffer frame is shown as a texture, not converted");
             }
         }
         Ok(())

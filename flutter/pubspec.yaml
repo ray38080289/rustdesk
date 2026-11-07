@@ -92,8 +92,8 @@ dependencies:
   flutter_keyboard_visibility: ^5.4.0
   texture_rgba_renderer:
     git:
-      url: https://github.com/rustdesk-org/flutter_texture_rgba_renderer
-      ref: 42797e0f03141dc2b585f76c64a13974508058b4
+      url: https://github.com/ray38080289/flutter_texture_rgba_renderer
+      ref: 64a19248b17374e9246ffc362fc7050aa26622de
   percent_indicator: ^4.2.2
   dropdown_button2: ^2.0.0
   flutter_gpu_texture_renderer:

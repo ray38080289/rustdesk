@@ -668,7 +668,14 @@ impl Decoder {
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h264_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h264s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h264s,
+                        rgb,
+                        &mut self.i420,
+                        _texture,
+                        _pixelbuffer,
+                    );
                 }
                 Err(anyhow!("don't support h264!"))
             }
@@ -682,7 +689,14 @@ impl Decoder {
                 }
                 #[cfg(feature = "hwcodec")]
                 if let Some(decoder) = &mut self.h265_ram {
-                    return Decoder::handle_hwram_video_frame(decoder, h265s, rgb, &mut self.i420);
+                    return Decoder::handle_hwram_video_frame(
+                        decoder,
+                        h265s,
+                        rgb,
+                        &mut self.i420,
+                        _texture,
+                        _pixelbuffer,
+                    );
                 }
                 Err(anyhow!("don't support h265!"))
             }
@@ -769,12 +783,34 @@ impl Decoder {
         frames: &EncodedVideoFrames,
         rgb: &mut ImageRgb,
         i420: &mut Vec<u8>,
+        _texture: &mut ImageTexture,
+        _pixelbuffer: &mut bool,
     ) -> ResultType<bool> {
         let mut ret = false;
         for h264 in frames.frames.iter() {
+            // macOS: a CVPixelBuffer from an earlier packet of this message is released by the next decode call.
+            #[cfg(target_os = "macos")]
+            if !*_pixelbuffer && !_texture.texture.is_null() {
+                *_texture = ImageTexture::default();
+                ret = false;
+            }
             for image in decoder.decode(&h264.data)? {
+                // macOS VideoToolbox: the CVPixelBuffer goes to the Flutter texture as it is. It stays valid
+                // until the next decode call, after the video callback has shown (and retained) it.
+                #[cfg(target_os = "macos")]
+                if let Some((pb, w, h)) = image.native() {
+                    *_texture = ImageTexture {
+                        texture: pb as _,
+                        w,
+                        h,
+                    };
+                    *_pixelbuffer = false;
+                    ret = true;
+                    continue;
+                }
                 // TODO: just process the last frame
                 if image.to_fmt(rgb, i420).is_ok() {
+                    *_pixelbuffer = true;
                     ret = true;
                 }
             }
