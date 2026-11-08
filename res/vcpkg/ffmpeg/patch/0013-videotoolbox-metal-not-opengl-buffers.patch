@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ray38080289 <ray38080289@users.noreply.github.com>
+Subject: [PATCH] videotoolbox: ask for Metal-compatible buffers on macOS, not OpenGL
+
+---
+--- a/libavcodec/videotoolbox.c
++++ b/libavcodec/videotoolbox.c
+@@ -790,7 +790,13 @@
+ #if TARGET_OS_IPHONE
+     CFDictionarySetValue(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);
+ #else
+-    CFDictionarySetValue(buffer_attributes, kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey, kCFBooleanTrue);
++    /* Metal, not OpenGL: the picture goes straight to a Metal texture (Flutter's external texture). Asking for
++       IOSurfaceOpenGLTextureCompatibility makes VideoToolbox convert every picture of a decoder whose pool has no
++       OpenGL backing (a third-party VideoToolbox decoder) with an extra GPU pass. RUSTDESK_VT_OPENGL=1 restores it. */
++    if (getenv("RUSTDESK_VT_OPENGL") && strcmp(getenv("RUSTDESK_VT_OPENGL"), "0"))
++        CFDictionarySetValue(buffer_attributes, kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey, kCFBooleanTrue);
++    else
++        CFDictionarySetValue(buffer_attributes, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
+ #endif
+ 
+     CFRelease(io_surface_properties);

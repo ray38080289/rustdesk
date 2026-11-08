@@ -30,6 +30,7 @@ vcpkg_from_github(
     patch/0010.disable-loading-DLLs-from-app-dir.patch
     patch/0011-android-mediacodec-encode-align-64.patch
     patch/0012-fix-macos-big-sur-CVBufferCopyAttachments.patch
+    patch/0013-videotoolbox-metal-not-opengl-buffers.patch
 )
 
 if(SOURCE_PATH MATCHES " ")
